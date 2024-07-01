@@ -3,6 +3,7 @@ package com.bargarapp.testserver
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.*
@@ -27,12 +28,9 @@ import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.consumeEach
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -43,17 +41,18 @@ import kotlin.random.Random
 class MainActivity : ComponentActivity() {
     private var server: NettyApplicationEngine? = null
     private var serverStatus by mutableStateOf("Stopped")
-    val dbHelper = DatabaseHelper(this)
+    private val dbHelper = DatabaseHelper(this)
+    private val clients = ConcurrentHashMap<String, WebSocketSession>()
+    private val clientJobs = ConcurrentHashMap<String, Job?>()
 
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            var port by remember { mutableStateOf(8080) }
+            var port by remember { mutableIntStateOf(8080) }
             var deviceIp by remember { mutableStateOf(getDeviceIpAddress(this)) }
             var showLogs by remember { mutableStateOf(false) }
-            var clientCount by remember { mutableStateOf(0) }
 
             MaterialTheme {
                 Column(
@@ -97,8 +96,6 @@ class MainActivity : ComponentActivity() {
                     ) {
                         Text("Show Logs")
                     }
-                    Text("Connected clients: $clientCount")
-
                     if (showLogs) {
                         LogsView(dbHelper.getAllLogs())
                     }
@@ -108,29 +105,73 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startServer(port: Int) {
-        GlobalScope.launch {
-            val clients = ConcurrentHashMap<String, WebSocketSession>()
-            val clientJobs = ConcurrentHashMap<String, Job>()
-            val deviceIp = getDeviceIpAddress(this@MainActivity)
-            server = embeddedServer(Netty, port = port, host = deviceIp) {
+        CoroutineScope(Dispatchers.Main).launch {
+            var clientIdFromMessage = " "
+            var count = 0
+            var clientId = " "
+            server = embeddedServer(Netty, port = port, host = getDeviceIpAddress(this@MainActivity)) {
                 install(WebSockets)
                 routing {
-                    webSocket("/gestures") { // WebSocket endpoint
-
-                        var clientId: String? = null
+                    webSocket("/gestures") {
                         try {
-                            // Обработчик события onConnect
-                            send(Frame.Text("Connected to the server"))
-                            clientId = clients.size.toString()
-                            clients[clientId] = this
-                            dbHelper.insertLog(System.currentTimeMillis(), "Client $clientId connected")
-
                             // Обработчик события onMessage
                             incoming.consumeEach { frame ->
                                 if (frame is Frame.Text) {
                                     val message = frame.readText()
-                                    dbHelper.insertLog(System.currentTimeMillis(), message+" from client "+clientId)
-                                    handleClientMessage(message, clientId, clients, CoroutineScope(Dispatchers.Default), clientJobs)
+                                    println(message)
+                                    if(message.split(",").size >1){
+                                        clientIdFromMessage = message.split(",")[1]
+                                    }
+
+                                    println(clientIdFromMessage)
+                                    if(clientIdFromMessage == "null"){
+                                        clientId = count++.toString()
+                                        send(Frame.Text(clientId))
+                                    }else if( clientIdFromMessage.length < 4){
+                                        clientId = clientIdFromMessage
+                                    }
+                                    Log.d("WebSocket", "Received message: $message")
+                                    when {
+                                        message.startsWith("firstcConnect") -> {
+                                            //подключились и отправили id
+                                            clients[clientId] = this
+                                            send(Frame.Text("Connected to the server"))
+                                            Log.d("WebSocket", "Client $clientId connected")
+                                            //подключились
+                                            dbHelper.insertLog(System.currentTimeMillis(), "Client $clientId connected")
+
+                                        }
+                                        message.startsWith("disconnect") -> {
+                                            //отключились
+                                            Log.d("WebSocket", "Disconnected")
+                                            clients.remove(clientId)
+                                            dbHelper.insertLog(System.currentTimeMillis(), "Client $clientId disconnected")
+                                        }
+
+                                        message.startsWith("start") -> {
+                                            val client = clients[clientId]
+                                            if(client == null){
+                                                Log.d("WebSocket", "Client = null")
+                                            }else{
+                                                clientJobs[clientId] = startGestures(client,clientId,clientJobs)
+                                                Log.d("WebSocket", "start gesture for client $clientId")
+                                            }
+
+                                        }
+                                        message.startsWith("pause") -> {
+                                            // Pause
+                                            pauseGestures(clientId,clientJobs)
+                                            Log.d("WebSocket", "pause gesture for client $clientId")
+                                        }
+                                        message.startsWith("Result") -> {
+                                            //пишем результат
+                                            dbHelper.insertLog(System.currentTimeMillis(),
+                                                "Client $clientId result gesture = $message"
+                                            )
+                                            Log.d("WebSocket", "result from client $clientId")
+                                        }
+                                    }
+
                                 }
                             }
                         } catch (e: Exception) {
@@ -140,7 +181,6 @@ class MainActivity : ComponentActivity() {
                             val clientJob = clientJobs.remove(clientId)
                             clientJob?.cancel() // Отменяем корутину клиента
                             clients.remove(clientId)
-                            dbHelper.insertLog(System.currentTimeMillis(), "Client $clientId disconnected")
                         }
                     }
                 }
@@ -149,77 +189,52 @@ class MainActivity : ComponentActivity() {
         }
     }
     private fun stopServer() {
-        server?.stop(1000, 1000)
-        serverStatus = "Stopped"
-    }
-
-    suspend fun handleClientMessage(
-        message: String,
-        clientId: String,
-        clients: ConcurrentHashMap<String, WebSocketSession>,
-        scope: CoroutineScope,
-        clientJobs: ConcurrentHashMap<String, Job>
-    ) {
-        val client = clients[clientId] ?: return
-
-        when (message) {
-            "start" -> {
-                // Проверяем, не запущена ли уже корутина для данного клиента
-                if (clientJobs[clientId]?.isActive != true) {
-                    // Запускаем корутину и сохраняем её в clientJobs
-                    clientJobs[clientId] = scope.launch {
-                        startGestures(client, this, clientId, clientJobs)
-                    }
-                }
-            }
-            "pause" -> {
-                // Останавливаем жесты для данного clientId
-                    pauseGestures(clientId, clientJobs)
-
-            }
-            else -> println("Unknown command: $message")
+        try {
+            server?.stop(1000, 1000)
+            serverStatus = "Stopped"
+        }catch (e:Exception){
+            e.printStackTrace()
+            serverStatus = "Stopped"
         }
+
     }
 
-    suspend fun startGestures(
+    private suspend fun startGestures(
         client: WebSocketSession,
-        scope: CoroutineScope,
         clientId: String,
-        clientJobs: ConcurrentHashMap<String, Job>
+        clientJobs: ConcurrentHashMap<String, Job?>
     ): Job {
         val gestures = generateGestures()
-        return CoroutineScope(Job() + Dispatchers.Main).launch {
+        return CoroutineScope(Dispatchers.Main).launch {
             for (gesture in gestures) {
                 // Проверяем, активна ли корутина перед отправкой каждого жеста
-                if (!isActive) {
-                    println("Sending gestures to client $clientId is paused")
+                val job = clientJobs[clientId]
+                if (job == null || !job.isActive) {
+                    Log.d("Gestures", "Sending gestures to client $clientId is paused")
                     break
                 }
                 val (direction, duration) = gesture
                 client.send(Frame.Text("Swipe $direction for $duration ms"))
-                dbHelper.insertLog(System.currentTimeMillis(), "Sent 'Swipe $direction for $duration ms' to client $clientId")
+                dbHelper.insertLog(System.currentTimeMillis(), "Sent 'Swipe $direction for $duration ms' to client $clientId ")
                 delay(duration.toLong())
-                // Проверяем состояние isActive после задержки
-                if (!isActive) {
-                    println("Sending gestures to client $clientId is paused after delay")
-                    break
-                }
             }
-        }.also { job ->
-            clientJobs[clientId] = job
         }
     }
 
-    suspend fun pauseGestures(
+    private fun pauseGestures(
         clientId: String,
-        clientJobs: ConcurrentHashMap<String, Job>
+        clientJobs: ConcurrentHashMap<String, Job?>
     ) {
         clientJobs[clientId]?.let { job ->
-            if (job.isActive) {
-                job.cancelAndJoin()
-                println("Paused sending gestures to client $clientId")
-                dbHelper.insertLog(System.currentTimeMillis(), "Paused sending gestures to client $clientId")
+            if (job != null) {
+                job.cancel()
+                dbHelper.insertLog(System.currentTimeMillis(), "Paused sending gestures to client $clientId ")
+            } else {
+                Log.d("Gestures", "Job for client $clientId is null")
+
             }
+        } ?: run {
+            Log.d("Gestures", "No job found for client $clientId")
         }
     }
 
@@ -239,7 +254,7 @@ class MainActivity : ComponentActivity() {
         LazyColumn(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(200.dp)
+                .height(400.dp)
         ) {
             items(logs) { log ->
                 LogItem(log)
@@ -260,11 +275,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    fun formatTimestamp(timestamp: Long): String {
+    private fun formatTimestamp(timestamp: Long): String {
         val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
         return dateFormat.format(Date(timestamp))
     }
-    fun generateGestures(): List<Pair<String, Int>> {
+    private fun generateGestures(): List<Pair<String, Int>> {
         val gestures = mutableListOf<Pair<String, Int>>()
 
         for (i in 1..999) { // Генерируем 999 жестов
